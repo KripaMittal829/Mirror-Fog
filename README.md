@@ -50,4 +50,5 @@ Pull requests are welcome! Please open an issue first to discuss what you’d li
 ---
 
 ## 📜 License
-MIT License
+This project is licensed under the MIT License – see the [LICENSE](LICENSE) file for details.
+
