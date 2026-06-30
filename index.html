@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mirror Fog v5</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #e69898; overflow: hidden; font-family: system-ui, sans-serif; }
+  #app { position: relative; width: 100vw; height: 100vh; background: #0a0a0a; overflow: hidden; }
+  #video {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: cover; transform: scaleX(-1);
+  }
+  /* fog sits on top of video */
+  #fog-canvas, #dot-canvas {
+    position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none;
+  }
+  #ui {
+    position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 10px; z-index: 10;
+  }
+  .btn {
+    background: rgba(0,0,0,0.45); border: 1px solid rgba(255,255,255,0.25);
+    color: #fff; font-size: 13px; padding: 8px 18px; border-radius: 20px;
+    cursor: pointer; backdrop-filter: blur(12px); transition: background 0.2s;
+    white-space: nowrap;
+  }
+  .btn:hover { background: rgba(0,0,0,0.65); }
+  .btn.active { border-color: rgba(255,255,255,0.6); background: rgba(0,0,0,0.7); }
+  #status {
+    position: absolute; top: 18px; left: 50%; transform: translateX(-50%);
+    color: rgba(255,255,255,0.7); font-size: 13px; z-index: 10;
+    pointer-events: none; text-align: center;
+    text-shadow: 0 1px 6px rgba(0,0,0,1); white-space: nowrap;
+  }
+  #pinch-pill {
+    position: absolute; top: 50px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.15);
+    color: rgba(255,255,255,0.5); font-size: 12px; padding: 4px 14px;
+    border-radius: 12px; z-index: 10; pointer-events: none;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  #pinch-pill.on { color: rgba(180,220,255,0.9); border-color: rgba(160,210,255,0.4); }
+  #loading {
+    position: absolute; inset: 0; background: rgba(0,0,0,0.85);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    color: rgba(255,255,255,0.65); font-size: 14px; gap: 14px; z-index: 50;
+    letter-spacing: 0.04em;
+  }
+  .spinner {
+    width: 28px; height: 28px;
+    border: 2px solid rgba(255,255,255,0.1);
+    border-top-color: rgba(255,255,255,0.6);
+    border-radius: 50%; animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div id="app">
+  <video id="video" autoplay muted playsinline></video>
+  <canvas id="fog-canvas"></canvas>
+  <canvas id="dot-canvas"></canvas>
+
+  <div id="loading">
+    <div class="spinner"></div>
+    <span id="load-text">loading hand tracking…</span>
+  </div>
+
+  <div id="status">start camera → blow / fog up → pinch to wipe</div>
+  <div id="pinch-pill">○ pinch to wipe fog</div>
+
+  <div id="ui">
+    <button class="btn" id="cam-btn">📷 Start Camera</button>
+    <button class="btn" id="fog-btn">🌬 Fog Up</button>
+    <button class="btn" id="clr-btn">↺ Re-fog</button>
+    <button class="btn" id="mic-btn">🎙 Breath Mode</button>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1640029074/camera_utils.js" crossorigin="anonymous"></script>
+<script>
+const app       = document.getElementById('app');
+const video     = document.getElementById('video');
+const fogCvs    = document.getElementById('fog-canvas');
+const dotCvs    = document.getElementById('dot-canvas');
+const fogCtx    = fogCvs.getContext('2d');
+const dotCtx    = dotCvs.getContext('2d');
+const statusEl  = document.getElementById('status');
+const loadEl    = document.getElementById('loading');
+const loadTxt   = document.getElementById('load-text');
+const pinchPill = document.getElementById('pinch-pill');
+const camBtn    = document.getElementById('cam-btn');
+const fogBtn    = document.getElementById('fog-btn');
+const clrBtn    = document.getElementById('clr-btn');
+const micBtn    = document.getElementById('mic-btn');
+
+let W = 0, H = 0;
+// fogMap: 0 = clear, 1 = fully fogged
+let fogMap = null;
+
+let camOn = false, micOn = false, handsReady = false;
+let audioCtx = null, analyser = null, micStream = null;
+
+// hand tracking state
+let sfx = -1, sfy = -1;   // smoothed index tip
+let stx = -1, sty = -1;   // smoothed thumb tip
+let isPinching = false;
+let handVisible = false;
+let rawLM = null;
+
+const SMOOTH     = 0.52;
+const PINCH_ON   = 0.065;
+const PINCH_OFF  = 0.095;
+
+// ── RADIAL FOG SHAPE ────────────────────────────────────
+// Fog is dense in a central oval (where your breath hits),
+// fading out to clear at edges — exactly like real mirror breath.
+// Max alpha is low so face is always visible.
+const FOG_CENTER_ALPHA = 180;  // alpha at densest point (0-255)
+const FOG_EDGE_ALPHA   = 0;    // alpha at screen edges
+const WIPE_RADIUS      = 50;
+const WIPE_STRENGTH    = 0.38;
+
+function resize() {
+  W = app.clientWidth; H = app.clientHeight;
+  fogCvs.width = dotCvs.width = W;
+  fogCvs.height = dotCvs.height = H;
+  fogMap = new Float32Array(W * H);
+}
+resize();
+window.addEventListener('resize', resize);
+
+// Build a radial fog — dense center patch fading at edges
+// cx, cy: center (0-1 normalised), rx, ry: radii (pixels)
+// amount: 0-1 how much to fog
+function applyRadialFog(cx, cy, rx, ry, amount) {
+  const px = cx * W, py = cy * H;
+  const x0 = Math.max(0, Math.floor(px - rx));
+  const x1 = Math.min(W-1, Math.ceil(px + rx));
+  const y0 = Math.max(0, Math.floor(py - ry));
+  const y1 = Math.min(H-1, Math.ceil(py + ry));
+  for (let j = y0; j <= y1; j++) {
+    for (let i = x0; i <= x1; i++) {
+      const dx = (i - px) / rx;
+      const dy = (j - py) / ry;
+      const d  = dx*dx + dy*dy; // 0 at center, 1 at ellipse edge
+      if (d > 1) continue;
+      // smooth step falloff: dense center, soft edges
+      const t = 1 - d;
+      const fog = t * t * (3 - 2*t) * amount; // smoothstep
+      fogMap[j * W + i] = Math.min(1, fogMap[j * W + i] + fog);
+    }
+  }
+}
+
+function fogUp() {
+  // Clear map
+  fogMap.fill(0);
+  // Main breath patch — center-ish, portrait oriented
+  // Mimics real breath: oval, centered slightly above middle (mouth level)
+  applyRadialFog(0.5, 0.48, W * 0.42, H * 0.38, 1.0);
+  // softer outer halo
+  applyRadialFog(0.5, 0.48, W * 0.52, H * 0.46, 0.45);
+  // add slight random texture variation
+  for (let i = 0; i < fogMap.length; i++) {
+    if (fogMap[i] > 0.01) fogMap[i] = Math.min(1, fogMap[i] + (Math.random() - 0.5) * 0.06);
+  }
+}
+
+// ── MediaPipe ────────────────────────────────────────────
+function onResults(res) {
+  if (!res.multiHandLandmarks || !res.multiHandLandmarks.length) {
+    handVisible = false; rawLM = null;
+    sfx = sfy = stx = sty = -1;
+    return;
+  }
+  handVisible = true;
+  rawLM = res.multiHandLandmarks[0];
+  const lm = rawLM;
+
+  const ix = (1 - lm[8].x) * W,  iy = lm[8].y * H;
+  const tx = (1 - lm[4].x) * W,  ty = lm[4].y * H;
+
+  sfx = sfx < 0 ? ix : sfx * SMOOTH + ix * (1 - SMOOTH);
+  sfy = sfy < 0 ? iy : sfy * SMOOTH + iy * (1 - SMOOTH);
+  stx = stx < 0 ? tx : stx * SMOOTH + tx * (1 - SMOOTH);
+  sty = sty < 0 ? ty : sty * SMOOTH + ty * (1 - SMOOTH);
+
+  const nd = Math.hypot(lm[8].x - lm[4].x, lm[8].y - lm[4].y);
+  if (!isPinching && nd < PINCH_ON)  isPinching = true;
+  if (isPinching  && nd > PINCH_OFF) isPinching = false;
+}
+
+let mpHands = null, mpCamera = null;
+function initHands() {
+  mpHands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/${f}` });
+  mpHands.setOptions({ maxNumHands:1, modelComplexity:1, minDetectionConfidence:0.75, minTrackingConfidence:0.65 });
+  mpHands.onResults(onResults);
+  mpHands.initialize().then(() => {
+    handsReady = true;
+    loadEl.style.display = 'none';
+    statusEl.textContent = 'ready ✓  start camera';
+  }).catch(() => { loadTxt.textContent = 'load failed — check internet & refresh'; });
+}
+
+// ── Buttons ──────────────────────────────────────────────
+camBtn.addEventListener('click', async () => {
+  if (camOn) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode:'user', width:{ideal:1280}, height:{ideal:720} }, audio:false
+    });
+    video.srcObject = stream;
+    camOn = true;
+    camBtn.classList.add('active');
+    camBtn.textContent = '📷 Camera On';
+    statusEl.textContent = 'fog up → pinch to wipe';
+    mpCamera = new Camera(video, {
+      onFrame: async () => { if (mpHands && handsReady) await mpHands.send({ image: video }); },
+      width: 1280, height: 720
+    });
+    mpCamera.start();
+  } catch(e) { statusEl.textContent = 'camera blocked — allow permission & reload'; }
+});
+
+fogBtn.addEventListener('click', () => {
+  fogUp();
+  statusEl.textContent = 'fogged ✓  pinch + move to wipe';
+  fogBtn.classList.add('active');
+  setTimeout(() => fogBtn.classList.remove('active'), 400);
+});
+
+clrBtn.addEventListener('click', () => {
+  fogUp();
+  statusEl.textContent = 're-fogged';
+});
+
+micBtn.addEventListener('click', async () => {
+  if (micOn) {
+    micStream && micStream.getTracks().forEach(t => t.stop());
+    try { audioCtx && await audioCtx.close(); } catch(e) {}
+    audioCtx = analyser = micStream = null;
+    micOn = false;
+    micBtn.classList.remove('active');
+    micBtn.textContent = '🎙 Breath Mode';
+    return;
+  }
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:false }, video:false
+    });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 1024;
+    analyser.smoothingTimeConstant = 0.4;
+    audioCtx.createMediaStreamSource(micStream).connect(analyser);
+    micOn = true;
+    micBtn.classList.add('active');
+    micBtn.textContent = '🎙 Listening…';
+    statusEl.textContent = 'blow into mic to fog 🌬';
+  } catch(e) { statusEl.textContent = 'mic blocked — check permissions'; }
+});
+
+function getMicRMS() {
+  if (!analyser) return 0;
+  const buf = new Float32Array(analyser.fftSize);
+  analyser.getFloatTimeDomainData(buf);
+  let s = 0; for (const v of buf) s += v*v;
+  return Math.sqrt(s / buf.length);
+}
+
+// ── Render loop ──────────────────────────────────────────
+function loop() {
+  requestAnimationFrame(loop);
+
+  // 1. Mic → radial fog from center
+  if (micOn) {
+    const rms = getMicRMS();
+    if (rms > 0.018) {
+      const strength = Math.min(rms * 5, 1);
+      // breath builds fog from center, grows with blow strength
+      applyRadialFog(0.5, 0.48, W * (0.25 + strength*0.2), H * (0.2 + strength*0.18), strength * 0.25);
+      statusEl.textContent = 'blowing… wipe to write ✍';
+    }
+  }
+
+  // 2. Pinch → wipe fog
+  if (sfx >= 0 && sfy >= 0 && isPinching) {
+    const x0 = Math.max(0, Math.floor(sfx - WIPE_RADIUS));
+    const x1 = Math.min(W-1, Math.ceil(sfx  + WIPE_RADIUS));
+    const y0 = Math.max(0, Math.floor(sfy - WIPE_RADIUS));
+    const y1 = Math.min(H-1, Math.ceil(sfy  + WIPE_RADIUS));
+    for (let j = y0; j <= y1; j++) {
+      for (let i = x0; i <= x1; i++) {
+        const d = Math.sqrt((i-sfx)**2 + (j-sfy)**2);
+        if (d < WIPE_RADIUS) {
+          const t = 1 - d / WIPE_RADIUS;
+          fogMap[j*W+i] = Math.max(0, fogMap[j*W+i] - t*t * WIPE_STRENGTH);
+        }
+      }
+    }
+  }
+
+  // 3. Render fog canvas
+  // Use a gradient-based render: fog color is a cool white, alpha from fogMap
+  const img = fogCtx.createImageData(W, H);
+  const d   = img.data;
+  for (let i = 0; i < fogMap.length; i++) {
+    const f = fogMap[i];
+    if (f < 0.005) continue;
+    const p = i * 4;
+    // very slightly warm white — real breath fog has a tiny warmth
+    d[p]   = 235;
+    d[p+1] = 238;
+    d[p+2] = 245;
+    d[p+3] = Math.round(f * FOG_CENTER_ALPHA);
+  }
+  fogCtx.putImageData(img, 0, 0);
+
+  // 4. Soft vignette blur effect on fog edges using canvas shadow
+  // (cheap: just a radial gradient overlay in multiply — darkens edges slightly like real mirror)
+  fogCtx.save();
+  const vign = fogCtx.createRadialGradient(W/2, H/2, H*0.2, W/2, H/2, H*0.75);
+  vign.addColorStop(0, 'rgba(0,0,0,0)');
+  vign.addColorStop(1, 'rgba(0,0,0,0.18)');
+  fogCtx.fillStyle = vign;
+  fogCtx.fillRect(0, 0, W, H);
+  fogCtx.restore();
+
+  // 5. Fingertip indicator dots
+  dotCtx.clearRect(0, 0, W, H);
+  if (handVisible && sfx >= 0) {
+    // thumb
+    if (stx >= 0) {
+      dotCtx.beginPath();
+      dotCtx.arc(stx, sty, 5, 0, Math.PI*2);
+      dotCtx.fillStyle = isPinching ? 'rgba(200,230,255,0.8)' : 'rgba(255,255,255,0.35)';
+      dotCtx.fill();
+    }
+    // index ring
+    dotCtx.beginPath();
+    dotCtx.arc(sfx, sfy, 14, 0, Math.PI*2);
+    dotCtx.strokeStyle = isPinching ? 'rgba(160,210,255,0.85)' : 'rgba(255,255,255,0.4)';
+    dotCtx.lineWidth = 1.5;
+    dotCtx.stroke();
+    // index dot
+    dotCtx.beginPath();
+    dotCtx.arc(sfx, sfy, 4, 0, Math.PI*2);
+    dotCtx.shadowColor = isPinching ? 'rgba(150,200,255,1)' : 'rgba(255,255,255,0.5)';
+    dotCtx.shadowBlur  = isPinching ? 14 : 4;
+    dotCtx.fillStyle   = isPinching ? 'rgba(210,235,255,1)' : 'rgba(255,255,255,0.6)';
+    dotCtx.fill();
+    dotCtx.shadowBlur  = 0;
+  }
+
+  // 6. Pinch pill
+  if (isPinching) {
+    pinchPill.textContent = '● wiping…';
+    pinchPill.classList.add('on');
+  } else if (handVisible) {
+    pinchPill.textContent = '○ pinch thumb + index to wipe';
+    pinchPill.classList.remove('on');
+  } else if (camOn) {
+    pinchPill.textContent = '○ show hand to camera';
+    pinchPill.classList.remove('on');
+  }
+}
+
+window.addEventListener('load', () => {
+  if (typeof Hands === 'undefined') {
+    loadTxt.textContent = 'MediaPipe failed — check internet & refresh';
+    return;
+  }
+  initHands();
+  loop();
+});
+</script>
+</body>
+</html>
